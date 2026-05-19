@@ -1,101 +1,101 @@
-from faster_whisper import WhisperModel
-import logging
+"""
+Speech-to-text service backed by faster-whisper.
+
+The Whisper model is several hundred MB and takes 30–60 s to load on a cold
+start. We defer loading until the first transcription so FastAPI's lifespan
+hook stays fast and the /health endpoint becomes available promptly.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import io
+import logging
+from typing import Optional, Union
+
 import numpy as np
 import soundfile as sf
-from typing import Union
+
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
 
 class STTService:
-    """Speech-to-Text Service"""
-    
     def __init__(self):
         self.provider = settings.STT_PROVIDER
         self.model_name = settings.WHISPER_MODEL
-        
-        if self.provider == "whisper":
-            # Use faster-whisper for better performance
-            logger.info(f"Loading Whisper model: {self.model_name}")
-            self.model = WhisperModel(
-                self.model_name,
-                device="cuda" if self._check_cuda() else "cpu",
-                compute_type="float16" if self._check_cuda() else "int8"
-            )
-            logger.info("Whisper model loaded successfully")
-    
+        self.model = None
+        # Lock ensures the model is loaded exactly once even under burst load.
+        self._load_lock: Optional[asyncio.Lock] = None
+
     def _check_cuda(self) -> bool:
-        """Check if CUDA is available"""
         try:
             import torch
             return torch.cuda.is_available()
-        except:
+        except Exception:
             return False
-    
-    async def transcribe(
-        self,
-        audio_data: Union[bytes, str],
-        language: str = "en"
-    ) -> str:
-        """Transcribe audio to text"""
+
+    def _build_model(self):
+        """Synchronous model load — run inside a thread to avoid blocking the loop."""
+        from faster_whisper import WhisperModel
+        device = "cuda" if self._check_cuda() else "cpu"
+        compute_type = "float16" if device == "cuda" else "int8"
+        logger.info(f"Loading Whisper model {self.model_name!r} on {device} ({compute_type})…")
+        model = WhisperModel(self.model_name, device=device, compute_type=compute_type)
+        logger.info("Whisper model loaded")
+        return model
+
+    async def initialize(self) -> None:
+        """Eager warm-up. Optional — `transcribe` will load on first call too."""
+        if self.model is not None or self.provider != "whisper":
+            return
+        if self._load_lock is None:
+            self._load_lock = asyncio.Lock()
+        async with self._load_lock:
+            if self.model is None:
+                self.model = await asyncio.to_thread(self._build_model)
+
+    async def transcribe(self, audio_data: Union[bytes, str], language: str = "en") -> str:
+        if self.provider != "whisper":
+            raise ValueError(f"Unsupported STT provider: {self.provider}")
+        if self.model is None:
+            await self.initialize()
+        return await asyncio.to_thread(self._transcribe_sync, audio_data, language)
+
+    def _transcribe_sync(self, audio_data: Union[bytes, str], language: str) -> str:
         try:
-            if self.provider == "whisper":
-                return await self._transcribe_whisper(audio_data, language)
-            else:
-                raise ValueError(f"Unsupported STT provider: {self.provider}")
-        
-        except Exception as e:
-            logger.error(f"Failed to transcribe audio: {e}")
-            raise
-    
-    async def _transcribe_whisper(
-        self,
-        audio_data: Union[bytes, str],
-        language: str = "en"
-    ) -> str:
-        """Transcribe using Whisper"""
-        try:
-            # Convert audio data to proper format
             if isinstance(audio_data, bytes):
-                # Load audio from bytes
                 audio, sample_rate = sf.read(io.BytesIO(audio_data))
             else:
-                # Load audio from file path
                 audio, sample_rate = sf.read(audio_data)
-            
-            # Convert to mono if stereo
+
+            # Mono mixdown
             if len(audio.shape) > 1:
                 audio = audio.mean(axis=1)
 
-            # Resample to 16kHz if needed
+            # Resample to 16 kHz (Whisper's expected rate)
             if sample_rate != 16000:
                 import librosa
                 audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=16000)
 
-            # faster-whisper / ONNX Runtime requires float32
             audio = audio.astype(np.float32)
-            
-            # Transcribe
+
+            assert self.model is not None  # for type checker
             segments, info = self.model.transcribe(
                 audio,
                 language=language,
                 beam_size=5,
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500)
+                vad_parameters=dict(min_silence_duration_ms=500),
             )
-            
-            # Combine all segments
-            transcription = " ".join([segment.text for segment in segments])
-            
-            logger.info(f"Transcription completed: {len(transcription)} characters")
-            return transcription.strip()
-        
+            transcription = " ".join(seg.text for seg in segments).strip()
+            logger.info(f"Transcribed {len(transcription)} chars (lang={info.language})")
+            return transcription
+
         except Exception as e:
             logger.error(f"Whisper transcription error: {e}")
             raise
-    
 
-# Global instance
+
 stt_service = STTService()

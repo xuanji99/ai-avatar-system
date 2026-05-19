@@ -3,6 +3,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from pydantic import BaseModel, Field
 import logging
 
 from app.database import get_db
@@ -112,3 +113,58 @@ async def get_message(
     except Exception as e:
         logger.error(f"Failed to get message: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to get message")
+
+
+class MessageEditPayload(BaseModel):
+    content: str = Field(..., min_length=1, max_length=8000)
+
+
+@router.patch("/{message_id}", response_model=MessageResponse)
+async def edit_message(
+    message_id: str,
+    payload: MessageEditPayload,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user),
+):
+    """Edit a message's content (must own the parent session)."""
+    try:
+        result = await db.execute(select(Message).where(Message.id == message_id))
+        message = result.scalar_one_or_none()
+        if not message:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+
+        await _get_owned_session(message.session_id, _user_id(current_user), db)
+        message.content = payload.content.strip()
+        await db.commit()
+        await db.refresh(message)
+        return message
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Failed to edit message: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to edit message")
+
+
+@router.delete("/{message_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_message(
+    message_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user),
+):
+    """Delete a message (must own the parent session)."""
+    try:
+        result = await db.execute(select(Message).where(Message.id == message_id))
+        message = result.scalar_one_or_none()
+        if not message:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+
+        await _get_owned_session(message.session_id, _user_id(current_user), db)
+        await db.delete(message)
+        await db.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Failed to delete message: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to delete message")

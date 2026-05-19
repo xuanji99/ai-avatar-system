@@ -2,12 +2,13 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import logging
 
 from app.database import get_db
-from app.models import Session, Avatar, User
+from app.models import Session, Avatar, Message, User
 from app.schemas import SessionCreate, SessionResponse
 from app.websocket import websocket_manager
 from app.api.v1.users import get_current_user
@@ -143,6 +144,61 @@ async def end_session(
     except Exception as e:
         logger.error(f"Failed to end session: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to end session")
+
+
+@router.get("/{session_id}/export")
+async def export_session(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user),
+):
+    """Export a session and its messages as a downloadable JSON file."""
+    try:
+        result = await db.execute(select(Session).where(Session.id == session_id))
+        session = result.scalar_one_or_none()
+        if not session:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        if session.user_id != _user_id(current_user):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorised")
+
+        msgs_result = await db.execute(
+            select(Message).where(Message.session_id == session_id).order_by(Message.created_at)
+        )
+        messages = msgs_result.scalars().all()
+
+        payload = {
+            "session": {
+                "id": session.id,
+                "avatar_id": session.avatar_id,
+                "status": session.status,
+                "started_at": session.started_at.isoformat() if session.started_at else None,
+                "ended_at": session.ended_at.isoformat() if session.ended_at else None,
+            },
+            "messages": [
+                {
+                    "id": m.id,
+                    "role": m.role,
+                    "content": m.content,
+                    "content_type": m.content_type,
+                    "created_at": m.created_at.isoformat() if m.created_at else None,
+                    "latency": m.latency,
+                }
+                for m in messages
+            ],
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+        }
+        headers = {
+            "Content-Disposition": f'attachment; filename="session-{session.id[:8]}.json"',
+        }
+        return JSONResponse(content=payload, headers=headers)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to export session: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to export session",
+        )
 
 
 @router.delete("/{session_id}", status_code=status.HTTP_204_NO_CONTENT)

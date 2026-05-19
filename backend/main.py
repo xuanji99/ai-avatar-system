@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Query, status
 from sqlalchemy import text, select
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -92,12 +92,14 @@ async def lifespan(app: FastAPI):
         app.mount("/uploads", StaticFiles(directory=str(uploads_dir)), name="uploads")
         logger.info(f"Serving local uploads from {uploads_dir}")
 
+    websocket_manager.start_cleanup_task()
     logger.info("AI Avatar System started successfully")
 
     yield
 
     # Cleanup
     logger.info("Shutting down AI Avatar System...")
+    await websocket_manager.stop_cleanup_task()
     await storage_service.cleanup()
     await cache_service.cleanup()
     logger.info("Shutdown complete")
@@ -204,7 +206,31 @@ async def health_check():
     except Exception:
         services["gpu"] = "error"
 
+    # LLM provider readiness — checks client wiring + API-key presence, not
+    # a live network call (which would cost tokens on every /health hit).
+    if settings.LLM_PROVIDER == "anthropic":
+        services["llm"] = "ready (anthropic)" if settings.ANTHROPIC_API_KEY else "missing ANTHROPIC_API_KEY"
+        if not settings.ANTHROPIC_API_KEY:
+            health["status"] = "degraded"
+    elif settings.LLM_PROVIDER == "openai":
+        services["llm"] = "ready (openai)" if settings.OPENAI_API_KEY else "missing OPENAI_API_KEY"
+        if not settings.OPENAI_API_KEY:
+            health["status"] = "degraded"
+    else:
+        services["llm"] = f"unknown provider: {settings.LLM_PROVIDER}"
+        health["status"] = "degraded"
+
+    # STT / TTS model state — lazy-loaded, so just report whether warmed
+    try:
+        from app.services.stt import stt_service
+        from app.services.tts import tts_service
+        services["stt"] = "loaded" if stt_service.model is not None else "lazy (not yet loaded)"
+        services["tts"] = "loaded" if tts_service.model is not None else "lazy (not yet loaded)"
+    except Exception as e:
+        services["stt"] = services["tts"] = f"error: {e}"
+
     health["avatar_engine"] = settings.AVATAR_ENGINE
+    health["active_ws_sessions"] = len(websocket_manager.active_connections)
 
     return health
 

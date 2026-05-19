@@ -30,6 +30,9 @@ MAX_TEXT_INPUT_LEN = 4000
 # System prompt is stored separately so it survives trimming.
 MAX_CONTEXT_MESSAGES = 60
 
+# Soft TTL for an idle (disconnected/abandoned) session in seconds.
+STALE_SESSION_TTL_SECS = 60 * 60 * 2  # 2 hours
+
 
 class ConnectionManager:
     """Manage WebSocket connections and the real-time avatar pipeline."""
@@ -37,6 +40,7 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
         self.session_data: Dict[str, dict] = {}
+        self._cleanup_task: Optional[asyncio.Task] = None
 
     # ── connection lifecycle ──────────────────────────────────────────────────
 
@@ -53,6 +57,7 @@ class ConnectionManager:
             "system_prompt": None,
             "user_id": user_id,
             "connected_at": datetime.now(timezone.utc),
+            "last_activity": datetime.now(timezone.utc),
         }
         await self._load_session_data(session_id)
         logger.info(f"WebSocket connected: {session_id} (user={user_id})")
@@ -155,6 +160,71 @@ class ConnectionManager:
                 logger.error(f"Send failed [{session_id}]: {e}")
                 await self.disconnect(session_id)
 
+    # ── DB persistence helpers ────────────────────────────────────────────────
+
+    async def _persist_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        latency: Optional[float] = None,
+    ) -> None:
+        """Best-effort persist a message; failure must not break the chat pipeline."""
+        try:
+            from app.database import AsyncSessionLocal
+            from app.models import Message
+            async with AsyncSessionLocal() as db:
+                db.add(Message(
+                    session_id=session_id,
+                    role=role,
+                    content=content,
+                    content_type="text",
+                    latency=latency,
+                ))
+                await db.commit()
+        except Exception as e:
+            logger.warning(f"Could not persist {role} message for {session_id}: {e}")
+
+    async def _ensure_conversation_title(self, session_id: str, first_user_text: str) -> None:
+        """
+        Lazily create a Conversation row for the session and seed its title from
+        the first user turn. Idempotent — safe to call on every text input.
+
+        Title heuristic: first 60 chars of the user's message, trimmed at a
+        word boundary. Cheap, no extra LLM call.
+        """
+        try:
+            from app.database import AsyncSessionLocal
+            from app.models import Conversation, Message
+            from sqlalchemy import select, func
+
+            async with AsyncSessionLocal() as db:
+                exists = await db.execute(
+                    select(Conversation.id).where(Conversation.session_id == session_id).limit(1)
+                )
+                if exists.scalar_one_or_none():
+                    return
+
+                snippet = first_user_text.strip().replace("\n", " ")
+                if len(snippet) > 60:
+                    cutoff = snippet.rfind(" ", 0, 60)
+                    snippet = snippet[: cutoff if cutoff > 30 else 60].rstrip(",.!?;:") + "…"
+
+                count_res = await db.execute(
+                    select(func.count()).select_from(Message)
+                    .where(Message.session_id == session_id)
+                )
+                msg_count = int(count_res.scalar() or 0)
+
+                db.add(Conversation(
+                    session_id=session_id,
+                    title=snippet or "New Conversation",
+                    message_count=msg_count,
+                ))
+                await db.commit()
+        except Exception as e:
+            logger.warning(f"Could not auto-title conversation for {session_id}: {e}")
+
     # ── handlers ──────────────────────────────────────────────────────────────
 
     async def handle_audio_input(self, session_id: str, audio_data: str):
@@ -211,8 +281,11 @@ class ConnectionManager:
             })
             return
 
+        started_at = datetime.now(timezone.utc)
+
         try:
             data = self.session_data.get(session_id, {})
+            data["last_activity"] = started_at
             messages: list[dict] = data.get("messages", [])
             messages.append({"role": "user", "content": text})
 
@@ -222,6 +295,12 @@ class ConnectionManager:
                 messages = messages[-MAX_CONTEXT_MESSAGES:]
 
             system_prompt = data.get("system_prompt")
+
+            # Persist the user turn before kicking off generation so it's
+            # durable even if the model fails partway through.
+            await self._persist_message(session_id, "user", text)
+            # Auto-title the conversation from the first user turn (idempotent)
+            await self._ensure_conversation_title(session_id, text)
 
             await self.send_message(session_id, {"type": "status", "message": "Thinking…", "stage": "llm"})
 
@@ -243,6 +322,8 @@ class ConnectionManager:
             if response_text:
                 messages.append({"role": "assistant", "content": response_text})
                 data["messages"] = messages
+                latency = (datetime.now(timezone.utc) - started_at).total_seconds()
+                await self._persist_message(session_id, "assistant", response_text, latency=latency)
 
         except Exception as e:
             logger.error(f"Text error [{session_id}]: {e}")
@@ -437,6 +518,51 @@ class ConnectionManager:
         if session_id in self.session_data:
             self.session_data[session_id]["language"] = lang
             logger.info(f"Language set [{session_id}]: {lang}")
+
+    # ── stale session cleanup ─────────────────────────────────────────────────
+
+    async def cleanup_stale(self) -> int:
+        """Reap sessions whose websocket is gone or that have been idle too long."""
+        now = datetime.now(timezone.utc)
+        stale: list[str] = []
+        for sid, data in list(self.session_data.items()):
+            last = data.get("last_activity") or data.get("connected_at") or now
+            if sid not in self.active_connections:
+                stale.append(sid)
+                continue
+            if (now - last).total_seconds() > STALE_SESSION_TTL_SECS:
+                stale.append(sid)
+        for sid in stale:
+            await self.disconnect(sid)
+        return len(stale)
+
+    def start_cleanup_task(self) -> None:
+        if self._cleanup_task is not None:
+            return
+
+        async def _loop():
+            while True:
+                try:
+                    await asyncio.sleep(300)
+                    reaped = await self.cleanup_stale()
+                    if reaped:
+                        logger.info(f"Reaped {reaped} stale WS session(s)")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"WS cleanup task error: {e}")
+
+        self._cleanup_task = asyncio.create_task(_loop(), name="ws-cleanup")
+
+    async def stop_cleanup_task(self) -> None:
+        if self._cleanup_task is None:
+            return
+        self._cleanup_task.cancel()
+        try:
+            await self._cleanup_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._cleanup_task = None
 
 
 websocket_manager = ConnectionManager()
