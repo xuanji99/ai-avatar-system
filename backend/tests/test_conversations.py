@@ -54,6 +54,28 @@ async def test_list_conversations_scoped_to_user(
 
 
 @pytest.mark.asyncio
+async def test_conversation_message_count_is_live(
+    client: AsyncClient, db_session, test_user, auth_headers
+):
+    """message_count reflects the live message total, not the stale stored 0."""
+    session = await _seed_session(db_session, test_user.id)
+    # Conversation row seeded with the stale default count of 0...
+    db_session.add(Conversation(session_id=session.id, title="Chat", message_count=0))
+    # ...but the session actually has 3 messages.
+    db_session.add(Message(session_id=session.id, role="user", content="a", content_type="text"))
+    db_session.add(
+        Message(session_id=session.id, role="assistant", content="b", content_type="text")
+    )
+    db_session.add(Message(session_id=session.id, role="user", content="c", content_type="text"))
+    await db_session.commit()
+
+    resp = await client.get("/api/v1/conversations/", headers=auth_headers)
+    assert resp.status_code == 200
+    mine = [c for c in resp.json() if c["title"] == "Chat"][0]
+    assert mine["message_count"] == 3  # live count, not the stored 0
+
+
+@pytest.mark.asyncio
 async def test_rename_conversation(client: AsyncClient, db_session, test_user, auth_headers):
     session = await _seed_session(db_session, test_user.id)
     convo = Conversation(session_id=session.id, title="Old", message_count=0)

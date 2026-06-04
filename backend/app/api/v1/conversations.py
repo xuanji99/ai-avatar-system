@@ -3,7 +3,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.users import get_current_user
@@ -31,6 +31,27 @@ async def _get_owned_session(session_id: str, uid: str, db: AsyncSession) -> Ses
     return session
 
 
+async def _attach_live_counts(conversations: list[Conversation], db: AsyncSession) -> None:
+    """
+    Overwrite each conversation's `message_count` with the live count of
+    messages on its session. The stored column is only seeded at creation
+    and never incremented as the chat grows, so reading it raw would always
+    show a stale (≈0) value in the history UI. We compute it at read time in
+    one grouped query and set it on the ORM objects in-memory (no commit).
+    """
+    if not conversations:
+        return
+    session_ids = [c.session_id for c in conversations]
+    result = await db.execute(
+        select(Message.session_id, func.count())
+        .where(Message.session_id.in_(session_ids))
+        .group_by(Message.session_id)
+    )
+    counts = {sid: n for sid, n in result.all()}
+    for c in conversations:
+        c.message_count = counts.get(c.session_id, 0)
+
+
 @router.get("/", response_model=List[ConversationResponse])
 async def list_conversations(
     skip: int = Query(0, ge=0),
@@ -49,7 +70,9 @@ async def list_conversations(
             .offset(skip)
             .limit(limit)
         )
-        return result.scalars().all()
+        conversations = list(result.scalars().all())
+        await _attach_live_counts(conversations, db)
+        return conversations
     except Exception as e:
         logger.error(f"Failed to list conversations: {e}")
         raise HTTPException(
@@ -74,6 +97,7 @@ async def get_conversation(
             )
 
         await _get_owned_session(conversation.session_id, _user_id(current_user), db)
+        await _attach_live_counts([conversation], db)
         return conversation
     except HTTPException:
         raise
@@ -99,7 +123,9 @@ async def list_session_conversations(
             .where(Conversation.session_id == session_id)
             .order_by(Conversation.created_at.desc())
         )
-        return result.scalars().all()
+        conversations = list(result.scalars().all())
+        await _attach_live_counts(conversations, db)
+        return conversations
     except HTTPException:
         raise
     except Exception as e:

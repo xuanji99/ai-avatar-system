@@ -214,3 +214,30 @@ async def test_set_voice_rejects_cross_tenant(monkeypatch):
     ok = await m.set_voice_by_id("s1", "some-voice")
     assert ok is False
     assert m.session_data["s1"]["voice_wav"] is None
+
+
+@pytest.mark.asyncio
+async def test_audio_transcribed_in_session_language(monkeypatch):
+    """STT must use the session's selected language, not always English."""
+    import base64
+
+    from app.services import stt as stt_module
+
+    m = ConnectionManager()
+    _wire_session(m)
+    m.session_data["s1"]["language"] = "fr"
+
+    captured = {}
+
+    async def fake_transcribe(audio, language="en"):
+        captured["language"] = language
+        return ""  # empty → handler returns before spawning a turn
+
+    monkeypatch.setattr(stt_module.stt_service, "transcribe", fake_transcribe)
+    # _handle_audio_inner reads the module-level stt_service via the ws module
+    from app import websocket as wsmod
+
+    monkeypatch.setattr(wsmod.stt_service, "transcribe", fake_transcribe)
+
+    await m._handle_audio_inner("s1", base64.b64encode(b"x" * 2000).decode())
+    assert captured.get("language") == "fr"

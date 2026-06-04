@@ -482,7 +482,10 @@ class ConnectionManager:
                 return
 
             await asyncio.to_thread(_write_private_bytes, tmp_audio, raw)
-            text = await stt_service.transcribe(str(tmp_audio))
+            # Transcribe in the session's selected language — otherwise Whisper
+            # assumes English and garbles non-English speech.
+            language = self.session_data.get(session_id, {}).get("language", "en")
+            text = await stt_service.transcribe(str(tmp_audio), language=language)
 
             if not text:
                 await self.send_message(
