@@ -2,6 +2,19 @@ FROM node:18-alpine
 
 WORKDIR /app
 
+# NEXT_PUBLIC_* values are inlined into the client bundle AT BUILD TIME —
+# setting them only as runtime env on the container has no effect on the
+# already-compiled JS. Accept them as build args (compose passes them via
+# build.args) and export as ENV so `npm run build` sees them.
+ARG NEXT_PUBLIC_API_URL=http://localhost:8000
+ARG NEXT_PUBLIC_WS_URL=ws://localhost:8000
+ARG NEXT_PUBLIC_S3_BUCKET_DOMAIN=
+ARG NEXT_PUBLIC_CLOUDFRONT_DOMAIN=
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL \
+    NEXT_PUBLIC_WS_URL=$NEXT_PUBLIC_WS_URL \
+    NEXT_PUBLIC_S3_BUCKET_DOMAIN=$NEXT_PUBLIC_S3_BUCKET_DOMAIN \
+    NEXT_PUBLIC_CLOUDFRONT_DOMAIN=$NEXT_PUBLIC_CLOUDFRONT_DOMAIN
+
 # Copy package files
 COPY package.json package-lock.json* ./
 

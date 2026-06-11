@@ -183,6 +183,10 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   const reconnectAttemptsRef = useRef(0)
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const sessionIdRef = useRef<string | null>(null)
+  // Same-value ref alongside the `ws` state: the unmount cleanup runs with
+  // the FIRST render's closure (deps []), where `ws` is still null — reading
+  // through a ref is the only way it sees the live socket.
+  const wsRef = useRef<WebSocket | null>(null)
   // True only when THIS mount created the session — so we end it on unmount.
   // A resumed session (opened from history) is left intact when the user leaves.
   const createdHereRef = useRef(false)
@@ -375,6 +379,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       reconnectTimerRef.current = setTimeout(() => connectWebSocket(sidNow), delay)
     }
 
+    wsRef.current = websocket
     setWs(websocket)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [voiceId, setWsConnected])
@@ -486,6 +491,11 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
 
   const sendMessage = () => {
     if (!inputText.trim() || !ws || !sessionId) return
+    if (ws.readyState !== WebSocket.OPEN) {
+      // send() on a CONNECTING socket throws; on CLOSED it silently drops.
+      toast.error('Not connected to the avatar yet — try again in a moment.')
+      return
+    }
     const emotion = detectEmotion(inputText)
     ws.send(JSON.stringify({ type: 'text', text: inputText }))
     setMessages(prev => [...prev, {
@@ -575,7 +585,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
         const reader = new FileReader()
         reader.onloadend = () => {
           const base64Audio = (reader.result as string).split(',')[1]
-          if (ws) {
+          if (ws && ws.readyState === WebSocket.OPEN) {
             setLatencyMs(null)
             sendTimeRef.current = Date.now()
             ws.send(JSON.stringify({ type: 'audio', audio: base64Audio }))
@@ -708,13 +718,17 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     return () => {
       // Cancel any pending reconnect
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
-      // Prevent reconnect loop on intentional unmount
+      // Read the session id BEFORE nulling the ref (which stops the
+      // reconnect loop). Don't use the `sessionId`/`ws` state here: this
+      // cleanup closes over the first render where both were still null,
+      // which used to leak the open socket and never end created sessions.
+      const sid = sessionIdRef.current
       sessionIdRef.current = null
-      ws?.close()
+      wsRef.current?.close()
+      wsRef.current = null
       setWsConnected(false)
       // Only end sessions WE created — leaving a resumed conversation should
       // not mark the user's existing session as ended.
-      const sid = sessionId
       if (sid && createdHereRef.current) api.endSession(sid).catch(() => {})
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -892,7 +906,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
                 onClick={exportConversation}
                 className="btn-icon"
                 title="Export conversation"
-                aria-label="Export conversation as JSON"
+                aria-label="Export conversation as text"
               >
                 <Download size={13} />
               </button>
