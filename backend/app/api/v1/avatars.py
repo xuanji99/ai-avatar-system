@@ -87,6 +87,14 @@ async def upload_avatar(
     except HTTPException:
         raise
     except Exception as e:
+        from PIL import UnidentifiedImageError
+
+        if isinstance(e, UnidentifiedImageError):
+            # Client sent something that isn't a decodable image — their
+            # fault, not ours.
+            raise HTTPException(
+                status_code=400, detail="File is not a valid image (JPG, PNG, WEBP)"
+            )
         logger.error(f"Avatar processing error: {e}")
         raise HTTPException(status_code=500, detail="Failed to process avatar")
     finally:
@@ -270,12 +278,22 @@ async def delete_avatar(
     if avatar.user_id != _user_id(current_user):
         raise HTTPException(status_code=403, detail="Not authorised to delete this avatar")
 
+    # Delete the DB row first (sessions/messages/conversations cascade), THEN
+    # the stored files — if the DB delete fails we haven't orphaned the row by
+    # removing its image out from under it.
+    try:
+        await db.delete(avatar)
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Failed to delete avatar {avatar_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete avatar")
+
     try:
         await storage_service.delete_file(avatar.s3_key)
         await storage_service.delete_file(avatar.s3_key.replace("image.jpg", "thumbnail.jpg"))
-        await db.delete(avatar)
-        await db.commit()
-        logger.info(f"Avatar deleted: {avatar_id}")
     except Exception as e:
-        logger.error(f"Failed to delete avatar {avatar_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to delete avatar")
+        # Row is gone; leftover files are harmless and reaped by the cleanup task.
+        logger.warning(f"Could not delete stored files for avatar {avatar_id}: {e}")
+
+    logger.info(f"Avatar deleted: {avatar_id}")

@@ -47,7 +47,7 @@ class Avatar(Base):
     # index=True is required for the hot "list my avatars" query — without it
     # PostgreSQL falls back to a sequential scan once the table grows past a
     # few thousand rows, turning a 5 ms lookup into a 500 ms one.
-    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     name = Column(String, nullable=False)
     image_url = Column(String, nullable=False)
     thumbnail_url = Column(String, nullable=True)
@@ -62,7 +62,10 @@ class Avatar(Base):
 
     # Relationships
     user = relationship("User", back_populates="avatars")
-    sessions = relationship("Session", back_populates="avatar")
+    # Deleting an avatar deletes its sessions (and, transitively, their
+    # messages/conversations). Without the cascade, deleting an avatar that
+    # had ever been chatted with raised a NOT NULL/FK violation → HTTP 500.
+    sessions = relationship("Session", back_populates="avatar", cascade="all, delete-orphan")
 
     __table_args__ = (
         # `ORDER BY created_at DESC LIMIT N` is the list-avatars query —
@@ -75,8 +78,10 @@ class Session(Base):
     __tablename__ = "sessions"
 
     id = Column(String, primary_key=True, default=generate_uuid)
-    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
-    avatar_id = Column(String, ForeignKey("avatars.id"), nullable=False, index=True)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    avatar_id = Column(
+        String, ForeignKey("avatars.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     status = Column(String, default="active", index=True)  # active/paused/ended filters by this
     settings = Column(JSON, nullable=True)
     started_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -86,6 +91,12 @@ class Session(Base):
     user = relationship("User", back_populates="sessions")
     avatar = relationship("Avatar", back_populates="sessions")
     messages = relationship("Message", back_populates="session", cascade="all, delete-orphan")
+    # Conversations hang off sessions too — without this cascade, deleting a
+    # session that had been auto-titled (i.e. any session with at least one
+    # turn) raised an FK violation → HTTP 500 from the delete endpoint.
+    conversations = relationship(
+        "Conversation", back_populates="session", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         # HistoryPanel's "list my sessions ordered by recency" query.
@@ -97,7 +108,9 @@ class Message(Base):
     __tablename__ = "messages"
 
     id = Column(String, primary_key=True, default=generate_uuid)
-    session_id = Column(String, ForeignKey("sessions.id"), nullable=False, index=True)
+    session_id = Column(
+        String, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     role = Column(String, nullable=False)  # user, assistant, system
     content = Column(Text, nullable=False)
     content_type = Column(String, default="text")  # text, audio, video
@@ -123,9 +136,14 @@ class Conversation(Base):
     __tablename__ = "conversations"
 
     id = Column(String, primary_key=True, default=generate_uuid)
-    session_id = Column(String, ForeignKey("sessions.id"), nullable=False, index=True)
+    session_id = Column(
+        String, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     title = Column(String, nullable=True)
     summary = Column(Text, nullable=True)
     message_count = Column(Integer, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    # Relationships
+    session = relationship("Session", back_populates="conversations")
