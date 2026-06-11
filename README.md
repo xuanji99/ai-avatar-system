@@ -43,19 +43,36 @@
 AvatarAI is an open-source, production-ready platform for building **photorealistic AI avatar conversations**. Upload any face photo, clone a voice from a 5-second audio clip, and have a real-time conversation — with **lip-sync video generated on every single response**.
 
 ```
-[mic input]  →  Whisper STT  →  Claude / GPT-4  →  XTTS v2 TTS  →  MuseTalk lip-sync  →  [video]
-                                 < 2–4 s first chunk on AWS GPU >
+[mic] → Whisper STT → Claude / GPT / Ollama (streaming) → Chatterbox TTS → MuseTalk lip-sync → [video]
+                              < 2–4 s to first video chunk on AWS GPU >
 ```
 
 **What makes AvatarAI different:**
-- 🎤 **Zero-shot voice cloning** — 5 seconds of audio is all you need (XTTS v2)
-- 🎭 **Any face, any language** — upload a JPEG, pick from 18 languages, start talking
-- ⚡ **Sentence-chunk streaming** — first video chunk plays while the rest is still being generated
-- 😴 **Idle animation** — avatar breathes and glows while waiting, no blank screens
-- 🔒 **100% local mode** — nothing leaves your machine
-- 🔌 **Multi-LLM** — Claude, GPT-4, or Llama 3 (free, local via Ollama)
+- 🎤 **Zero-shot voice cloning** — 10 seconds of audio is all you need (Chatterbox Multilingual)
+- 🎭 **Any face, any language** — upload a JPEG, pick from 23 languages, start talking
+- ⚡ **Token-streaming pipeline** — the LLM streams live tokens while TTS + lip-sync run per sentence; the first video chunk plays before the model finishes its reply
+- ✋ **Barge-in** — speak (or hit stop) mid-reply and the avatar yields instantly, like a real conversation
+- 🔒 **100% local mode** — local storage, local Whisper, local LLM via Ollama: nothing leaves your machine
+- 🔌 **Multi-LLM** — Claude (with prompt caching), GPT-4o, or any local model via Ollama / vLLM / LM Studio
 - 🚀 **AWS GPU deployment** — one-command deploy to `g5.xlarge` for true real-time (~30 FPS)
-- 🏗️ **Production-ready** — JWT auth, rate limiting, S3 storage, Terraform IaC
+- 🏗️ **Production-grade** — JWT + httpOnly-cookie auth, per-user rate limiting, Postgres + Alembic, S3/CloudFront, Prometheus, CI, a real test suite — the only project in this niche you can ship as a product, not just a demo
+
+---
+
+## ⚔️ How AvatarAI compares
+
+| | **AvatarAI** | Duix-Avatar | Linly-Talker | AIAvatarKit |
+|---|---|---|---|---|
+| Real-time conversation | ✅ WebSocket streaming | ❌ offline video gen | ✅ (Gradio / WebRTC spin-off) | ✅ |
+| Lip-sync video | ✅ MuseTalk V1.5 | ✅ proprietary models | ✅ multiple engines | ❌ (drives external avatars) |
+| Voice cloning | ✅ 10 s, 23 languages | ✅ | ✅ | ❌ |
+| Barge-in / interruption | ✅ | ❌ | ✅ (stream variant) | ✅ |
+| Local / free LLM | ✅ Ollama, vLLM | ❌ | ✅ | ✅ |
+| Web app with auth & history | ✅ Next.js + JWT + Postgres | ❌ Windows client | ❌ Gradio demo UI | ❌ library |
+| Rate limiting, CI, tests, IaC | ✅ | ❌ | ❌ | ❌ |
+| License | MIT | custom | MIT | Apache-2.0 |
+
+> Toolkits like Linly-Talker are great research playgrounds; Duix ships a Windows product. **AvatarAI is the one you can deploy as a real multi-user web service.**
 
 ---
 
@@ -63,14 +80,15 @@ AvatarAI is an open-source, production-ready platform for building **photorealis
 
 | Category | Details |
 |---|---|
-| 🤖 **LLM Backends** | Claude (Anthropic) · GPT-4o (OpenAI) · Llama 3 (Ollama, local) |
-| 🎤 **Voice Cloning** | Record 5–30 s → XTTS v2 zero-shot speaker embedding |
-| 🗣️ **Speech-to-Text** | OpenAI Whisper (`faster-whisper`, CUDA-accelerated), 18+ languages |
-| 🎬 **Lip-Sync Video** | MuseTalk V1.5 (30 FPS on GPU) · FFmpeg fallback (CPU) |
-| ⚡ **Streaming Pipeline** | Sentence chunks stream over WebSocket as they complete |
-| 😴 **Idle Animation** | CSS breathing animation while avatar waits — no blank screens |
+| 🤖 **LLM Backends** | Claude (prompt-cached) · GPT-4o · **Ollama / vLLM / LM Studio (local, free)** |
+| 🎤 **Voice Cloning** | Record 10–60 s → Chatterbox Multilingual zero-shot cloning |
+| 🗣️ **Speech-to-Text** | Whisper (`faster-whisper`, CUDA), decodes browser WebM natively |
+| 🎬 **Lip-Sync Video** | MuseTalk V1.5 persistent worker (30 FPS on GPU) · FFmpeg fallback (CPU) |
+| ⚡ **Streaming Pipeline** | Live LLM tokens + per-sentence video chunks over WebSocket |
+| ✋ **Barge-In** | Speak or hit stop mid-reply — in-flight turn cancels in ms |
+| 🔉 **TTS Fallback Chain** | chatterbox → edge-tts (free neural voices) → gTTS — never silent |
 | 😊 **Emotion Detection** | Live emotion badges per message |
-| 🌍 **18+ Languages** | Whisper multilingual STT + XTTS v2 multilingual TTS |
+| 🌍 **23 Languages** | Whisper multilingual STT + Chatterbox multilingual TTS |
 | 🏠 **Local-First Storage** | `USE_LOCAL_STORAGE=true` — no AWS needed for dev |
 | 🔐 **Auth & Sessions** | JWT authentication, conversation history, persistent sessions |
 | 📊 **Observability** | Prometheus · Celery Flower · Sentry · structured logging |
@@ -192,6 +210,15 @@ docker compose up -d
 
 > **No AWS required.** Set `USE_LOCAL_STORAGE=true` (default) — uploads saved to `backend/uploads/`.
 
+**Want something to talk to immediately?** Seed three ready-made demo avatars (AI-generated faces + personalities):
+
+```bash
+backend/venv/bin/python scripts/seed_demo.py            # or any python with `requests`
+backend/venv/bin/python scripts/seed_demo.py --with-voices   # + cloned demo voices
+```
+
+Prebuilt images are also published on every release — `ghcr.io/punithvt/ai-avatar-system-backend` and `…-frontend`.
+
 ### Option B — Manual (development)
 
 ```bash
@@ -307,10 +334,10 @@ bash deploy.sh production
 
 ## 🎤 Voice Cloning
 
-Powered by [XTTS v2](https://github.com/coqui-ai/TTS) — zero-shot voice cloning from 5 seconds of audio.
+Powered by [Chatterbox Multilingual](https://github.com/resemble-ai/chatterbox) (Resemble AI) — zero-shot voice cloning from a 10-second sample, in 23 languages.
 
 1. Go to **Voice** tab → **Clone Voice**
-2. Record 5–30 s of clear speech (or upload a WAV/MP3)
+2. Record 10–60 s of clear speech (or upload a WAV/MP3/WebM)
 3. Name it → **Clone** → select it for your session
 
 Every TTS response then uses your cloned voice.
@@ -360,20 +387,26 @@ WS  /ws/session/{session_id}
 
 **Client → Server:**
 ```json
-{ "type": "text",      "text": "Hello!" }
-{ "type": "audio",     "audio": "<base64-webm>" }
-{ "type": "set_voice", "voice_wav_path": "/path/to/speaker.wav" }
+{ "type": "text",         "text": "Hello!" }
+{ "type": "audio",        "audio": "<base64-webm>" }
+{ "type": "stop" }                                  // barge-in: cancel the in-flight reply
+{ "type": "set_voice",    "voice_id": "<uuid>" }    // attach a cloned voice (owner-checked)
+{ "type": "set_language", "language": "es" }
+{ "type": "ping" }
 ```
 
 **Server → Client:**
 ```json
-{ "type": "transcription",   "text": "Hello!" }
-{ "type": "message",         "content": "Hi!", "role": "assistant" }
-{ "type": "video_chunk_start","total_chunks": 3 }
-{ "type": "video_chunk",     "chunk_index": 0, "video_url": "...", "text": "Hi!" }
-{ "type": "video_chunk_end" }
-{ "type": "status",          "message": "Animating part 1 of 3…" }
-{ "type": "error",           "message": "Something went wrong" }
+{ "type": "token",            "token": "Hel" }       // live LLM stream
+{ "type": "transcription",    "text": "Hello!" }
+{ "type": "message",          "content": "Hi!", "role": "assistant" }
+{ "type": "video_chunk_start","total_chunks": -1 }   // -1 = streaming, total unknown
+{ "type": "video_chunk",      "chunk_index": 0, "video_url": "...", "text": "Hi!" }
+{ "type": "video_chunk_end",  "sent_chunks": 3 }
+{ "type": "status",           "message": "Animating…", "stage": "animation" }
+{ "type": "tts_fallback",     "engine": "edge-tts", "voice_cloned": false, "message": "…" }
+{ "type": "interrupted",      "message": "Previous response interrupted" }
+{ "type": "error",            "message": "Something went wrong" }
 ```
 
 ---
@@ -384,27 +417,28 @@ Key `.env` variables:
 
 ```bash
 # LLM
-LLM_PROVIDER=anthropic            # anthropic | openai | ollama
-LLM_MODEL=claude-sonnet-4-20250514
+LLM_PROVIDER=anthropic            # anthropic | openai | ollama (local & free)
+LLM_MODEL=claude-sonnet-4-6       # or gpt-4o · llama3.1 · qwen2.5 …
 ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_BASE_URL=                  # e.g. http://localhost:11434/v1 for Ollama / vLLM / LM Studio
 
 # Avatar engine
 AVATAR_ENGINE=musetalk            # musetalk (GPU recommended) | simple (CPU fallback)
 MUSETALK_PATH=models/MuseTalk
 
-# TTS
-TTS_PROVIDER=coqui                # coqui (XTTS v2) | elevenlabs
-ELEVENLABS_API_KEY=...
+# TTS — automatic fallback chain: chatterbox → edge-tts → gtts
+TTS_PROVIDER=chatterbox
 
 # STT
-WHISPER_MODEL=base                # tiny | base | small | medium | large-v3
+WHISPER_MODEL=large-v3-turbo      # tiny | base | small | medium | large-v3 | large-v3-turbo
 
 # Storage
-USE_LOCAL_STORAGE=true            # false → AWS S3
+USE_LOCAL_STORAGE=true            # false → AWS S3 (+ presigned URLs / CloudFront)
 S3_BUCKET_NAME=...
 
-# Auth
-SECRET_KEY=change-me-in-production
+# Auth (≥32 chars enforced at boot)
+SECRET_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
+JWT_SECRET_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
 JWT_EXPIRATION_HOURS=24
 ```
 
@@ -433,9 +467,10 @@ JWT_EXPIRATION_HOURS=24
 ### AI / ML
 | Model | Purpose |
 |---|---|
-| Claude / GPT-4o / Llama 3 | LLM conversation |
+| Claude / GPT-4o / Ollama (local) | LLM conversation |
 | Whisper (`faster-whisper`) | Speech-to-text |
-| XTTS v2 (Coqui TTS) | TTS + zero-shot voice cloning |
+| Chatterbox Multilingual (Resemble AI) | TTS + zero-shot voice cloning, 23 languages |
+| Edge TTS → gTTS | Free no-GPU fallback voices |
 | MuseTalk V1.5 | Photorealistic lip-sync (30 FPS on GPU) |
 
 ---
@@ -451,34 +486,72 @@ pytest --cov=app --cov-report=html  # HTML coverage
 
 ---
 
+## 📰 What's New
+
+- **2026-06** — Edge-TTS neural fallback chain · local LLMs via Ollama/vLLM · demo avatar seeding · prebuilt GHCR images · cascade-delete + WebM-STT + 429 fixes · SEO/metadata pass
+- **2026-05** — httpOnly-cookie auth (XSS-safe) · conversation resume from history · end-to-end WebSocket tests · perf indexes (migration 0002)
+- **2026-03** — Chatterbox Multilingual replaces XTTS v2 (23 languages) · MuseTalk persistent worker (models load once) · barge-in interruption · live token streaming
+
+---
+
 ## 🗺️ Roadmap
 
-- [ ] **Streaming LLM** — start TTS before LLM finishes (token-by-token)
+- [x] **Streaming LLM** — TTS + lip-sync start before the LLM finishes (token-by-token) ✅
+- [x] **Barge-in** — interrupt the avatar mid-reply by speaking ✅
+- [x] **Local LLMs** — Ollama / vLLM / LM Studio via OpenAI-compatible API ✅
+- [ ] **Hands-free mode** — VAD-driven always-listening with auto end-of-turn (no tap-to-record)
+- [ ] **WebRTC streaming** — sub-second full-duplex audio/video instead of chunked MP4
+- [ ] **Wav2Lip engine** — lighter lip-sync option for weaker GPUs
 - [ ] **Emotion-driven animation** — detected emotion changes facial expression
 - [ ] **Embeddable widget** — drop a talking avatar into any website with 3 lines of JS
-- [ ] **Multi-avatar conversations** — two avatars talking to each other
 - [ ] **Long-term memory** — RAG + vector DB for persistent context
-- [ ] **Mobile app** — React Native iOS/Android client
-- [ ] **Video call integration** — replace your face in Zoom/Meet
+- [ ] **UI i18n** — the pipeline speaks 23 languages; the UI should too
 
 ---
 
 ## ❓ FAQ
 
-**Q: Do I need a GPU?**
-A: No — everything runs on CPU. MuseTalk takes 30–90 s/sentence on CPU. For real-time performance, use an AWS `g5.xlarge` (~$0.30/hr spot).
+<details>
+<summary><strong>Do I need a GPU?</strong></summary>
 
-**Q: Can I run it with no API key?**
-A: Yes — set `LLM_PROVIDER=ollama` and run [Ollama](https://ollama.ai) locally. Fully offline and free.
+No — everything runs on CPU. MuseTalk takes 30–90 s/sentence on CPU (the `simple` engine is instant). For real-time lip-sync, use an AWS `g5.xlarge` (~$0.30/hr spot) or any 16 GB+ NVIDIA card.
+</details>
 
-**Q: How do I get MuseTalk models?**
-A: Run `bash scripts/setup_musetalk.sh` — downloads ~9 GB of models automatically.
+<details>
+<summary><strong>Can I run it with no API key, fully offline?</strong></summary>
 
-**Q: Why does the first response take longer?**
-A: The MuseTalk persistent worker loads all models into GPU VRAM on the first request (~60 s on GPU, ~5 min on CPU). Subsequent requests are fast.
+Yes — set `LLM_PROVIDER=ollama`, run [Ollama](https://ollama.com) (`ollama run llama3.1`), and you have a fully local, free conversation stack: Whisper STT, local LLM, Chatterbox TTS, MuseTalk video.
+</details>
 
-**Q: What avatar photo works best?**
-A: A clear, well-lit frontal face photo (JPEG/PNG/WebP). Avoid sunglasses or heavy occlusion.
+<details>
+<summary><strong>How do I get something to talk to quickly?</strong></summary>
+
+Run `python scripts/seed_demo.py` — it creates three demo avatars (AI-generated faces, distinct personalities) and optionally cloned demo voices with `--with-voices`.
+</details>
+
+<details>
+<summary><strong>How do I get MuseTalk models?</strong></summary>
+
+Run `bash scripts/setup_musetalk.sh` — downloads ~9 GB of models automatically.
+</details>
+
+<details>
+<summary><strong>Why does the first response take longer?</strong></summary>
+
+The MuseTalk persistent worker loads all models into GPU VRAM on the first request (~60 s on GPU, ~5 min on CPU). Subsequent requests reuse the loaded models.
+</details>
+
+<details>
+<summary><strong>What happens if the TTS model can't load?</strong></summary>
+
+The pipeline degrades gracefully: chatterbox → **edge-tts** (free Microsoft neural voices) → gTTS. The UI shows a one-time notice when a cloned voice couldn't be applied.
+</details>
+
+<details>
+<summary><strong>What avatar photo works best?</strong></summary>
+
+A clear, well-lit frontal face photo (JPEG/PNG/WebP). Avoid sunglasses or heavy occlusion.
+</details>
 
 ---
 
@@ -498,7 +571,7 @@ git push origin feat/my-feature
 
 ## 📄 License
 
-MIT © 2025 — see [LICENSE](LICENSE) for details.
+MIT © 2026 — see [LICENSE](LICENSE) for details.
 
 ---
 
@@ -512,6 +585,12 @@ MIT © 2025 — see [LICENSE](LICENSE) for details.
 
 <br/><br/>
 
-<sub>Built with FastAPI · Next.js · MuseTalk V1.5 · XTTS v2 · Whisper · Claude AI</sub>
+<a href="https://star-history.com/#PunithVT/ai-avatar-system&Date">
+  <img src="https://api.star-history.com/svg?repos=PunithVT/ai-avatar-system&type=Date" width="600" alt="Star History Chart" />
+</a>
+
+<br/><br/>
+
+<sub>Built with FastAPI · Next.js · MuseTalk V1.5 · Chatterbox · Whisper · Claude AI</sub>
 
 </div>
