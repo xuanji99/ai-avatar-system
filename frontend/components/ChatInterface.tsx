@@ -245,15 +245,14 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     isPlayingRef.current = true
     setShowVideo(true)
     if (videoRef.current) {
-      // If the preload element already buffered this URL, swap src instantly
-      const preload = preloadVideoRef.current
-      if (preload && preload.src === next.url && preload.readyState >= 3) {
-        videoRef.current.src = next.url
-      } else {
-        videoRef.current.src = next.url
-      }
+      videoRef.current.src = next.url
       videoRef.current.muted = isMuted
-      videoRef.current.play().catch(() => {})
+      // A rejected play() (autoplay policy, decode error) must not strand the
+      // queue — skip to the next chunk so playback can't hang on one bad clip.
+      videoRef.current.play().catch(() => {
+        if (chunkQueueRef.current.length > 0) playNextChunk()
+        else { isPlayingRef.current = false; setShowVideo(false) }
+      })
     }
     // Preload the next chunk in queue (if any)
     const upcoming = chunkQueueRef.current[0]
@@ -262,13 +261,23 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     }
   }, [isMuted])
 
-  // Attach onended handler to video element
+  // Attach ended + error handlers to the video element. The error handler is
+  // critical: a 404 / expired presigned URL / undecodable chunk fires `error`
+  // (not `ended`), so without this the whole reply hangs on one bad chunk.
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
-    const handler = () => playNextChunk()
-    video.addEventListener('ended', handler)
-    return () => video.removeEventListener('ended', handler)
+    const onEnded = () => playNextChunk()
+    const onError = () => {
+      if (chunkQueueRef.current.length > 0) playNextChunk()
+      else { isPlayingRef.current = false; setShowVideo(false) }
+    }
+    video.addEventListener('ended', onEnded)
+    video.addEventListener('error', onError)
+    return () => {
+      video.removeEventListener('ended', onEnded)
+      video.removeEventListener('error', onError)
+    }
   }, [playNextChunk])
 
   // Sync muted state to video element
@@ -727,6 +736,17 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       wsRef.current?.close()
       wsRef.current = null
       setWsConnected(false)
+
+      // Release media resources so navigating away mid-playback/recording
+      // doesn't leak: a still-playing <video>, an open AudioContext, and a
+      // running rAF loop all survive unmount otherwise.
+      const video = videoRef.current
+      if (video) { video.pause(); video.removeAttribute('src'); video.load() }
+      if (levelAnimRef.current !== null) cancelAnimationFrame(levelAnimRef.current)
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+        audioContextRef.current.close().catch(() => {})
+      }
+
       // Only end sessions WE created — leaving a resumed conversation should
       // not mark the user's existing session as ended.
       if (sid && createdHereRef.current) api.endSession(sid).catch(() => {})
