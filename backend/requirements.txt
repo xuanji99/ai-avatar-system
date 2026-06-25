@@ -52,7 +52,7 @@ faster-whisper>=1.0.0
 # Chatterbox by Resemble AI — fastest open-source TTS w/ voice cloning + 23 langs
 # (en, es, fr, de, it, pt, pl, tr, ru, nl, ar, zh, ja, ko, da, el, fi, he, hi,
 # ms, no, sv, sw). Replaces deprecated Coqui XTTS v2.
-chatterbox-tts>=0.1.4
+# chatterbox-tts>=0.1.4  # removed: conflicts with diffusers 0.32.2; replaced by EdgeTTS in P2
 # Edge TTS — free Microsoft neural voices used as the first fallback when
 # Chatterbox is unavailable (no API key, no GPU). gTTS remains the last resort.
 edge-tts>=6.1.0

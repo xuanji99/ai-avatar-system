@@ -21,8 +21,9 @@ class AvatarAnimator:
     """
     Avatar Animation Service.
     Supported engines (set AVATAR_ENGINE in .env):
-      - musetalk : MuseTalk V1.5 — persistent worker (models loaded once)
-      - simple   : ffmpeg static image + audio, no lip-sync
+      - musetalk  : MuseTalk V1.5 — persistent worker (models loaded once)
+      - minimates : MiniMates — Mac CPU real-time lip-sync (PyTorch P1 / ncnn P4)
+      - simple    : ffmpeg static image + audio, no lip-sync
     """
 
     def __init__(self):
@@ -33,6 +34,7 @@ class AvatarAnimator:
         self.use_float16 = self.device == "cuda"  # float16 on GPU = ~2× faster via Tensor Cores
         self._initialised = False
         self._musetalk_dir: Optional[Path] = None
+        self._minimates_dir: Optional[Path] = None
 
         # Persistent worker handles
         self._worker_proc: Optional[asyncio.subprocess.Process] = None
@@ -76,6 +78,20 @@ class AvatarAnimator:
                 self._worker_env["PYTHONPATH"] = str(self._musetalk_dir) + (
                     ":" + existing if existing else ""
                 )
+
+        elif self.engine == "minimates":
+            self._minimates_dir = self._find_dir(settings.MINIMATES_PATH, "interface/interface_audio.py")
+            if self._minimates_dir is None:
+                logger.warning(
+                    "MiniMates not found at '%s'. "
+                    "Download models from https://pan.baidu.com/s/18stswLIZ0zyCcVWF7kTV7g?pwd=zosn "
+                    "and place under the checkpoint/ directory. "
+                    "Falling back to simple animation.",
+                    settings.MINIMATES_PATH,
+                )
+                self.engine = "simple"
+            else:
+                logger.info(f"MiniMates found at: {self._minimates_dir} (PyTorch CPU P1)")
 
         elif self.engine not in ("simple",):
             logger.warning(f"Unknown engine '{self.engine}', using simple animation.")
@@ -224,6 +240,8 @@ class AvatarAnimator:
         try:
             if self.engine == "musetalk":
                 return await self._animate_musetalk(avatar_image_path, audio_path, output_path)
+            elif self.engine == "minimates":
+                return await self._animate_minimates(avatar_image_path, audio_path, output_path)
             else:
                 return await self._animate_simple(avatar_image_path, audio_path, output_path)
         except Exception as e:
@@ -250,6 +268,61 @@ class AvatarAnimator:
 
         logger.info(f"MuseTalk animation done: {output_path}")
         return output_path
+
+    # ── MiniMates ────────────────────────────────────────────────────────────────
+
+    async def _animate_minimates(
+        self,
+        avatar_path: str,
+        audio_path: str,
+        output_path: str,
+    ) -> str:
+        """Run MiniMates via subprocess (PyTorch CPU, P1 validation).
+
+        P1 uses PyTorch CPU for model validation. P4 switches to ncnn-cpu
+        for production latency (ncnn is 10-30× faster than PyTorch CPU).
+        """
+        minimates_dir: Path = self._minimates_dir  # type: ignore[assignment]
+        interface_script = minimates_dir / "interface" / "interface_audio.py"
+
+        # Ensure output is .mp4 (MiniMates interface_audio.py expects video output)
+        output = Path(output_path)
+        if output.suffix.lower() != ".mp4":
+            output = output.with_suffix(".mp4")
+
+        cmd = [
+            sys.executable,
+            str(interface_script),
+            str(Path(avatar_path).resolve()),
+            str(Path(audio_path).resolve()),
+            str(output.resolve()),
+        ]
+
+        logger.info(f"MiniMates: {' '.join(cmd)}")
+
+        # PyTorch CPU inference — can be slow (30-90s per sentence)
+        timeout = 600  # 10 min generous timeout for CPU
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(minimates_dir),
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError(f"MiniMates inference timed out after {timeout}s")
+
+        if proc.returncode != 0:
+            err = stderr.decode(errors="replace")[:2000]
+            logger.error(f"MiniMates error (exit {proc.returncode}):\n{err}")
+            raise RuntimeError(f"MiniMates failed: {err[-500:]}")
+
+        logger.info(f"MiniMates animation done: {output}")
+        return str(output)
 
     # ── Simple ffmpeg fallback ────────────────────────────────────────────────
 
